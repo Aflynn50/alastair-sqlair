@@ -41,6 +41,7 @@ type Field struct {
 	OmitEmpty bool
 }
 
+// Calling a struct simply Struct is pretty confusing
 // Struct represents reflected information about a struct type.
 type Struct struct {
 	value reflect.Value

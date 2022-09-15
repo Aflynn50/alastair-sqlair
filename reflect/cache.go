@@ -54,6 +54,9 @@ func generate(value reflect.Value) (Info, error) {
 	// If this is a not a struct, we can not provide
 	// any further reflection information.
 	// FIXME: We need to support &M derived from map[string]any
+	// AF: I think we're saying here that we need to support things that arnt just structs
+	//     maybe maps with string keys as well - specifically this new M value outlined in the spec
+	// 	   which is a map that we dump the values into when the user doenst give any tags
 	if value.Kind() != reflect.Struct {
 		return Value{value: value}, nil
 	}
@@ -67,7 +70,7 @@ func generate(value reflect.Value) (Info, error) {
 	typ := value.Type()
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
-		// Fields without a "db" tag are outside of Sqlair's remit.
+		// Fields without a "db" tag are outside of Sqlair's remit. AF: This then ignores them
 		tag := field.Tag.Get("db")
 		if tag == "" {
 			continue

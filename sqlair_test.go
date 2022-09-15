@@ -377,6 +377,33 @@ func TestRound(t *testing.T) {
 	}
 }
 
+func TestOutputPartToSQL(t *testing.T) {
+	q := "select p.* as &Person.*"
+	expectedOutputs := []string{"p.id, p.name, p.address_id"}
+	parser := NewParser()
+	qparsed, err := parser.Parse(q)
+	if err != nil {
+		t.Errorf("Parser didn't work, err: %s", err)
+	}
+	qpreped, err := qparsed.Prepare(&Person{})
+	if err != nil {
+		t.Errorf("Perpare didn't work, err: %s", err)
+	}
+	ops := []string{}
+	for _, p := range qpreped.Parsed.parts {
+		switch p.(type) {
+		case *outputPart:
+			op := p.(*outputPart)
+			s, err := op.ToSql(qpreped)
+			if err != nil {
+				t.Errorf("ToSql didn't work, err: %s", err)
+			}
+			ops = append(ops, s)
+		}
+	}
+	assert.Equal(t, expectedOutputs, ops)
+}
+
 // We fail Prepare when passing a type
 // that does not have corresponding DSL piece in the statement
 func TestSuperflousType(t *testing.T) {
