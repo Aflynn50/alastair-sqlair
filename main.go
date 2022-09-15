@@ -502,22 +502,22 @@ type OutputInfo struct {
 func (pe *PreparedExpr) Complete(arguments ...any) (*CompletedExpr, error) {
 	var ce CompletedExpr
 	ce.arguments = arguments
+	ce.outputSpecs = pe.OutputSpecs
 	ioparts := 0
 	for _, p := range pe.Parsed.parts {
-		switch p.(type) {
+		switch p := p.(type) {
 		case *stringPart:
-			ce.Add(p.(*stringPart).Chunk)
+			ce.Add(p.Chunk)
 		case *inputPart:
 			ioparts++
-			str, _ := p.(*inputPart).ToSql()
+			str, _ := p.ToSql()
 			ce.Add(str)
 		case *outputPart:
 			ioparts++
-			str, _ := p.(*outputPart).ToSql(pe)
+			str, _ := p.ToSql(pe)
 			ce.Add(str)
 		}
-	} //AF: Surely this should be checked before we cycle through the expression. If there are not
-	// arguments then th
+	}
 	if ioparts != len(arguments) {
 		return nil, fmt.Errorf("Parameters mismatch. Expected %d, have %d", ioparts, len(arguments))
 	}
@@ -525,9 +525,10 @@ func (pe *PreparedExpr) Complete(arguments ...any) (*CompletedExpr, error) {
 }
 
 type CompletedExpr struct {
-	sb        strings.Builder
-	arguments []any
-	rows      *sql.Rows
+	sb          strings.Builder
+	arguments   []any
+	outputSpecs []OutputInfo
+	rows        *sql.Rows
 }
 
 // add pushes a new piece to the SQL statement that will be ready to be executed
@@ -587,65 +588,136 @@ func (ce *CompletedExpr) Exec(db *sql.DB, parts []Part, argTypes typeMap) error 
 
 // AF: outputs are the vars to put the outputs INTO
 func (ce *CompletedExpr) Scan(parts []Part, argTypes typeMap, outputs ...any) error {
-	//FIXME: This method assumes many things, among other, that there is
-	//only one field to be decoded. We should iterate over all the fields in
-	//the struct and decode all of them that are used in the query.
-	c := sqlairreflect.Cache()
-	var outputPartIndex int
-	for _, part := range parts {
-		switch part.(type) {
-		case *outputPart:
-			op := part.(*outputPart) //AF: We need this because 'part' is currently only
-			//really something implementing the interface
-			optypename := op.Fields[0].Type                       // optypename is the name of the Struct to output into (i.e. Person)
-			reflected, err := c.Reflect(outputs[outputPartIndex]) // Get the info about the output types and put in reflected
-			if err != nil {
-				return err
-			}
-			// This checks if the output type given back in Prepare is the same as
-			// the type of the var that has been passed to Scan
-			if reflected.Name() == optypename { // reflected.Name() is the name of the type we want to output into
-				// infstruct is and Info Struct
-				infstruct := argTypes[optypename] // argTypes should be the type of the input expressions
-				// Confiusingly there is a struct called Struct. And even though infsruct is only know to be of type Info
-				// here, WE know that it is in fact a Struct which has a Fields field. How confusing.
-				struc := infstruct.(sqlairreflect.Struct)
 
-				s := reflect.ValueOf(outputs[outputPartIndex]).Elem()
-				columns, _ := ce.rows.Columns()
-				values := make([]interface{}, len(columns))
-				valuePtrs := make([]interface{}, len(columns))
-				for i := range columns {
-					valuePtrs[i] = &values[i]
-				}
-				ce.rows.Next() // We should really have a Next method for the whole CompleteExpression interface
-				ce.rows.Scan(valuePtrs...)
-				ce.rows.Close()
+	outputPartIndex := 0
 
-				for i, colName := range columns {
-					val := values[i]
-					field, found := struc.Fields[colName]
-					if !found {
-						return fmt.Errorf("can not found tag for '%s' in output variable", colName)
-					}
-					findex := field.Index
-					outputField := s.Field(findex)
-					valType := reflect.TypeOf(val)
-					if !outputField.CanSet() {
-						return fmt.Errorf("the field %s of %s is not exported", field.Name, struc.Name())
-					}
-					if valType == outputField.Type() {
-						outputField.Set(reflect.ValueOf(val))
-					} else {
-						return fmt.Errorf("the column %s is type %s but the struct %s has type %s", colName, valType, field.Name, outputField.Type())
-					}
-				}
-			}
-			outputPartIndex++
-		}
+	columns, _ := ce.rows.Columns()
+	values := make([]interface{}, len(columns))
+	valuePtrs := make([]interface{}, len(columns))
+	colToIndex := map[string]int{}
+	for i, colName := range columns {
+		valuePtrs[i] = &values[i]
+		colToIndex[colName] = i
 	}
+
+	ce.rows.Next() // We should really have a Next method for the whole CompleteExpression interface
+	ce.rows.Scan(valuePtrs...)
+	ce.rows.Close()
+
+	for _, oi := range ce.outputSpecs {
+		outputStruct := argTypes[oi.OutputTypeName].(sqlairreflect.Struct)
+		s := reflect.ValueOf(outputs[outputPartIndex]).Elem()
+
+		for _, colName := range oi.OutputColumns {
+			field, found := outputStruct.Fields[colName]
+
+			if !found {
+				return fmt.Errorf("can not found column '%s' of output type %s in results", colName, oi.OutputTypeName)
+			}
+			val := values[colToIndex[colName]]
+			findex := field.Index
+			outputField := s.Field(findex)
+			valType := reflect.TypeOf(val)
+			if !outputField.CanSet() {
+				return fmt.Errorf("the field %s of %s is not exported", field.Name, oi.OutputTypeName)
+			}
+			if valType == outputField.Type() {
+				outputField.Set(reflect.ValueOf(val))
+			} else {
+				return fmt.Errorf("the column %s is type %s but the struct %s has type %s", colName, valType, field.Name, outputField.Type())
+			}
+		}
+		outputPartIndex++
+	}
+
 	return nil
 }
+
+//// AF: outputs are the vars to put the outputs INTO
+//func (ce *CompletedExpr) Scan(parts []Part, argTypes typeMap, outputs ...any) error {
+//	c := sqlairreflect.Cache()
+//	var outputPartIndex int
+//	for _, part := range parts {
+//		switch part.(type) {
+//		case *outputPart:
+//			op := part.(*outputPart) //AF: We need this because 'part' is currently only
+//			//really something implementing the interface
+//			optypename := op.Fields[0].Type                       // optypename is the name of the Struct to output into (i.e. Person)
+//			reflected, err := c.Reflect(outputs[outputPartIndex]) // Get the info about the output types and put in reflected
+//			if err != nil {
+//				return err
+//			}
+//			// This checks if the output type given back in Prepare is the same as
+//			// the type of the var that has been passed to Scan
+//			if reflected.Name() == optypename { // reflected.Name() is the name of the type we want to output into
+//				// infstruct is and Info Struct
+//				infstruct := argTypes[optypename] // argTypes should be the type of the input expressions
+//				// Confiusingly there is a struct called Struct. And even though infsruct is only know to be of type Info
+//				// here, WE know that it is in fact a Struct which has a Fields field. How confusing.
+//				struc := infstruct.(sqlairreflect.Struct)
+//
+//				s := reflect.ValueOf(outputs[outputPartIndex]).Elem()
+//				columns, _ := ce.rows.Columns()
+//				values := make([]interface{}, len(columns))
+//				valuePtrs := make([]interface{}, len(columns))
+//				colToIndex := map[string]int{}
+//				for i, colName := range columns {
+//					valuePtrs[i] = &values[i]
+//					colToIndex[colName] = i
+//				}
+//
+//				ce.rows.Next() // We should really have a Next method for the whole CompleteExpression interface
+//				ce.rows.Scan(valuePtrs...)
+//				ce.rows.Close()
+//
+//				for _, oi := range ce.outputSpecs {
+//					outputStruct := argTypes[oi.OutputTypeName].(sqlairreflect.Struct)
+//
+//					for _, colName := range oi.OutputColumns {
+//						field, found := outputStruct.Fields[colName]
+//
+//						if !found {
+//							return fmt.Errorf("can not found column '%s' of output type %s in results", colName, oi.OutputTypeName)
+//						}
+//						val := values[colToIndex[colName]]
+//						findex := field.Index
+//						outputField := s.Field(findex)
+//						valType := reflect.TypeOf(val)
+//						if !outputField.CanSet() {
+//							return fmt.Errorf("the field %s of %s is not exported", field.Name, struc.Name())
+//						}
+//						if valType == outputField.Type() {
+//							outputField.Set(reflect.ValueOf(val))
+//						} else {
+//							return fmt.Errorf("the column %s is type %s but the struct %s has type %s", colName, valType, field.Name, outputField.Type())
+//						}
+//					}
+//				}
+//
+//				for i, colName := range columns {
+//					val := values[i]
+//					field, found := struc.Fields[colName]
+//					if !found {
+//						return fmt.Errorf("can not found tag for '%s' in output variable", colName)
+//					}
+//					findex := field.Index
+//					outputField := s.Field(findex)
+//					valType := reflect.TypeOf(val)
+//					if !outputField.CanSet() {
+//						return fmt.Errorf("the field %s of %s is not exported", field.Name, struc.Name())
+//					}
+//					if valType == outputField.Type() {
+//						outputField.Set(reflect.ValueOf(val))
+//					} else {
+//						return fmt.Errorf("the column %s is type %s but the struct %s has type %s", colName, valType, field.Name, outputField.Type())
+//					}
+//				}
+//			}
+//			outputPartIndex++
+//		}
+//	}
+//	return nil
+//}
 
 // typesForStatement returns reflection information for the input arguments.
 // The reflected type name of each argument must be unique in the list,
@@ -897,7 +969,7 @@ func createDb() (*sql.DB, error) {
 	}
 	_, err = db.Exec("Create table citizens (citizen_name varchar, citizen_age int, citizen_income int);")
 	if err != nil {
-		return nil, fmt.Errorf("Error creating table: %v", err)
+		return nil, fmt.Errorf("error creating table: %v", err)
 	}
 	inserts := []string{"INSERT INTO citizens VALUES ('Fred', 30, 1000);",
 		"INSERT INTO citizens VALUES ('Mark', 20, 1500);",
@@ -906,7 +978,7 @@ func createDb() (*sql.DB, error) {
 	for _, q := range inserts {
 		_, err := db.Exec(q)
 		if err != nil {
-			return nil, fmt.Errorf("Error inserting data: %v", err)
+			return nil, fmt.Errorf("error inserting data: %v", err)
 		}
 	}
 
@@ -928,14 +1000,16 @@ func main() {
 	}
 
 	var manager Person
+	var otherguy Person
 	//q := "select p.* as &Person.* from citizens AS p"
-	q := "select * as &Person.* from citizens"
+	//q := "select * as &Person.* from citizens"
+	q := "select * as &Person.*, citizen_name as &Person.* from citizens"
 	//q := "select citizen_income AS &Person from citizens where citizen_income = $Person.citizen_income"
 	// q := "select citizen_income, citizen_name AS &Person from citizens where citizen_income = $Person.citizen_income"
 	fmt.Printf("Input query: %s\n", q)
 	if parsedexp, err := p.Parse(q); err == nil {
 		if preparedexp, err := parsedexp.Prepare(&Person{}); err == nil {
-			if completedexpr, err := preparedexp.Complete(&Person{}); err == nil {
+			if completedexpr, err := preparedexp.Complete(&Person{}, &Person{}); err == nil {
 				//if completedexpr, err := preparedexp.Complete(&Person{}, &Person{Income: 3500}); err == nil {
 				fmt.Printf("Parsed AST: %+v\n", parsedexp)
 				fmt.Printf("Prepared query: %s\n", completedexpr.Sql())
@@ -948,11 +1022,11 @@ func main() {
 					fmt.Println(err)
 					return
 				}
-				if err := completedexpr.Scan(parsedexp.parts, preparedexp.ArgTypes, &manager); err != nil {
+				if err := completedexpr.Scan(parsedexp.parts, preparedexp.ArgTypes, &manager, &otherguy); err != nil {
 					fmt.Println(err)
 					return
 				}
-				fmt.Printf("Result: %+v", manager)
+				fmt.Printf("Result: manager - %+v, other guy - %+v", manager, otherguy)
 			} else {
 				fmt.Printf("error completing query: %s", err)
 			}
